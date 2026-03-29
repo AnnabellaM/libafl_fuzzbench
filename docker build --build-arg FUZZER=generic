@@ -1,0 +1,1 @@
+./docker/run_experiments.sh --fuzzers "cmplog" --targets "bloaty" --trials 2 --duration 10
