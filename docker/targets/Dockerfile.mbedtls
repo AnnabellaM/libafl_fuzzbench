@@ -54,9 +54,21 @@ RUN mkdir -p /src/mbedtls/build && \
 RUN mkdir -p /fuzz /corpus /seeds && \
     ${CC} --libafl-no-link \
         -I /src/mbedtls/include \
+        -I /src/mbedtls/tests/include \
         -c /src/mbedtls/programs/fuzz/fuzz_dtlsclient.c \
         -o /tmp/fuzz_dtlsclient.o && \
-    ${CXX} /tmp/fuzz_dtlsclient.o \
+    ${CC} --libafl-no-link \
+        -I /src/mbedtls/include \
+        -I /src/mbedtls/tests/include \
+        -c /src/mbedtls/programs/fuzz/common.c \
+        -o /tmp/fuzz_common.o && \
+    ${CC} --libafl-no-link \
+        -I /src/mbedtls/include \
+        -I /src/mbedtls/tests/include \
+        -I /src/mbedtls/library \
+        -c /src/mbedtls/tests/src/certs.c \
+        -o /tmp/certs.o && \
+    ${CXX} /tmp/fuzz_dtlsclient.o /tmp/fuzz_common.o /tmp/certs.o \
         /src/mbedtls/build/library/libmbedtls.a \
         /src/mbedtls/build/library/libmbedx509.a \
         /src/mbedtls/build/library/libmbedcrypto.a \

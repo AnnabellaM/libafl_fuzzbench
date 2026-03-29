@@ -20,7 +20,7 @@ TRIALS=3
 DURATION=86400        # 24 hours in seconds
 FUZZERS="generic fast naive cmplog mopt"
 TARGETS="harfbuzz bloaty"
-RESULTS_DIR="$(pwd)/results"
+RESULTS_DIR="$(pwd)/out"
 SEEDS_DIR="$(pwd)/docker/seeds"
 # ── arg parsing ─────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do

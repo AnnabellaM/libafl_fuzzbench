@@ -41,11 +41,13 @@ RUN ./autogen.sh && \
 # links in the real LibAFL fuzzer engine.
 RUN mkdir -p /fuzz /corpus /seeds && \
     ${CXX} --libafl /src/cms_transform_fuzzer.cc \
+        -std=c++14 \
         -I include/ src/.libs/liblcms2.a \
-        -o /fuzz/cms_transform_fuzzer && \
-    # Use a real ICC profile from the repo as seed, fall back to magic bytes
-    find /src/Little-CMS -name "*.icc" | head -1 | xargs -I{} cp {} /seeds/seed.icc 2>/dev/null || \
-        printf '\x00\x00\x00\x0cLCMS\x00\x00\x00\x00' > /seeds/seed.icc
+        -o /fuzz/cms_transform_fuzzer
+
+# Use a real ICC profile from the repo as seed, fall back to magic bytes
+RUN find /src/Little-CMS -name "*.icc" | head -1 | xargs -I{} cp {} /seeds/seed.icc 2>/dev/null || \
+    printf '\x00\x00\x00\x0cLCMS\x00\x00\x00\x00' > /seeds/seed.icc
 
 ENV DURATION=86400
 

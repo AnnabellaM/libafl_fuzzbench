@@ -7,20 +7,22 @@ use libafl::observers::CanTrack;
 use libafl::HasMetadata;
 use libafl_bolts::{
     current_nanos,
+    impl_serdeany,
     os::dup2,
-    rands::StdRand,
+    rands::{Rand, StdRand},
     shmem::{ShMemProvider, StdShMemProvider},
-    tuples::{tuple_list, Merge},
-    AsSlice,
+    tuples::{tuple_list, Merge, NamedTuple},
+    AsSlice, Named,
 };
 
 use clap::{Arg, Command};
-use core::time::Duration;
+use core::{num::NonZeroUsize, time::Duration};
 #[cfg(unix)]
 use nix::{self, unistd::dup};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::{
+    borrow::Cow,
     env,
     fs::{self, File},
     io::{self, Read, Write},
@@ -29,35 +31,213 @@ use std::{
 };
 
 use libafl::{
-    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
+    corpus::{Corpus, HasCurrentCorpusId, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleRestartingEventManager,
     executors::{inprocess::InProcessExecutor, ExitKind},
     feedback_or,
-    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
+    feedbacks::{CrashFeedback, Feedback, MaxMapFeedback, StateInitializer, TimeFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
-    mutators::{havoc_mutations::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
+    mutators::{
+        havoc_mutations::havoc_mutations, tokens_mutations, LogMutationMetadata, MutationResult,
+        Mutator, MutatorsTuple, Tokens,
+    },
     observers::{HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::StdMutationalStage,
-    state::{HasCorpus, StdState},
+    state::{HasCorpus, HasExecutions, HasRand, HasStartTime, StdState},
     Error,
 };
 use libafl_targets::{
     libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer, CMP_MAP,
 };
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use libafl_targets::autotokens;
 
+// ---------------------------------------------------------------------------
+// Lineage tracking
+// ---------------------------------------------------------------------------
+
+/// State metadata that holds the mutation names applied during the current
+/// mutation. Written by [`LineageMutator`] in `mutate()` and consumed by
+/// [`LineageFeedback`] in `append_metadata()` — which is called *before*
+/// `corpus.add()` writes the `.metadata` file to disk.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct MutationLog {
+    pub names: Vec<Cow<'static, str>>,
+    /// Total executions at the time `mutate()` was called.
+    pub execs: u64,
+    /// Milliseconds since fuzzing started at the time `mutate()` was called.
+    pub elapsed_ms: u64,
+}
+impl_serdeany!(MutationLog);
+
+/// Testcase metadata written by [`LineageFeedback`] before the entry is saved
+/// to disk. Mirrors AFL++'s `src:NNNNNN,time:TTTTTT,execs:EEEEEE` encoding.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ParentInfo {
+    /// Raw [`CorpusId`] integer of the parent (None for seeds / initial inputs).
+    pub parent_id: Option<u64>,
+    /// Filename of the parent as stored on disk (if available).
+    pub parent_file: Option<String>,
+    /// Total executions when this entry was discovered.
+    pub execs: u64,
+    /// Milliseconds of fuzzing elapsed when this entry was discovered.
+    pub elapsed_ms: u64,
+}
+impl_serdeany!(ParentInfo);
+
+/// A mutator that applies random stacked mutations (like [`StdScheduledMutator`])
+/// and records the name of each applied mutation into [`MutationLog`] in state.
+pub struct LineageMutator<MT> {
+    name: Cow<'static, str>,
+    mutations: MT,
+    max_stack_pow: NonZeroUsize,
+}
+
+impl<MT: NamedTuple> LineageMutator<MT> {
+    pub fn new(mutations: MT) -> Self {
+        Self {
+            name: Cow::from(format!("LineageMutator[{}]", mutations.names().join(", "))),
+            mutations,
+            max_stack_pow: NonZeroUsize::new(7).unwrap(),
+        }
+    }
+}
+
+impl<MT> Named for LineageMutator<MT> {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<I, S, MT> Mutator<I, S> for LineageMutator<MT>
+where
+    S: HasRand + HasMetadata + HasExecutions + HasStartTime,
+    MT: MutatorsTuple<I, S> + NamedTuple,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+        // Snapshot execs and elapsed time at the start of this mutation round
+        let execs = *state.executions();
+        let elapsed_ms = (libafl_bolts::current_time() - *state.start_time()).as_millis() as u64;
+
+        // Initialise or clear the log for this mutation round
+        if state.metadata_map().contains::<MutationLog>() {
+            let log = state.metadata_map_mut().get_mut::<MutationLog>().unwrap();
+            log.names.clear();
+            log.execs = execs;
+            log.elapsed_ms = elapsed_ms;
+        } else {
+            state.add_metadata(MutationLog { names: vec![], execs, elapsed_ms });
+        }
+
+        // Pick a random number of mutations: 1 .. 2^max_stack_pow (mirrors StdScheduledMutator)
+        let num = 1 + state.rand_mut().below(self.max_stack_pow);
+        // Safety: mutations tuple is non-empty (compile-time guarantee from havoc_mutations)
+        let mutations_len = NonZeroUsize::new(self.mutations.len()).expect("mutations must be non-empty");
+        let mut result = MutationResult::Skipped;
+
+        for _ in 0..num {
+            let idx = state.rand_mut().below(mutations_len);
+            let outcome = self.mutations.get_and_mutate(idx.into(), state, input)?;
+            if outcome == MutationResult::Mutated {
+                result = MutationResult::Mutated;
+                if let Some(name) = self.mutations.name(idx as usize) {
+                    state
+                        .metadata_map_mut()
+                        .get_mut::<MutationLog>()
+                        .unwrap()
+                        .names
+                        .push(name.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// A feedback that attaches [`LogMutationMetadata`] to a testcase **before**
+/// it is saved to disk. Always returns `false` from `is_interesting` so it
+/// never influences the interesting decision on its own.
+pub struct LineageFeedback {
+    name: Cow<'static, str>,
+}
+
+impl LineageFeedback {
+    pub fn new() -> Self {
+        Self { name: "LineageFeedback".into() }
+    }
+}
+
+impl Named for LineageFeedback {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<S> StateInitializer<S> for LineageFeedback {}
+
+impl<EM, OT, S> Feedback<EM, BytesInput, OT, S> for LineageFeedback
+where
+    S: HasMetadata + HasCurrentCorpusId + HasCorpus + HasExecutions + HasStartTime,
+{
+    fn append_metadata(
+        &mut self,
+        state: &mut S,
+        _manager: &mut EM,
+        _observers: &OT,
+        testcase: &mut Testcase<BytesInput>,
+    ) -> Result<(), Error> {
+        // Attach mutation names
+        if let Some(log) = state.metadata_map().get::<MutationLog>() {
+            if !log.names.is_empty() {
+                testcase.add_metadata(LogMutationMetadata::new(log.names.clone()));
+            }
+        }
+
+        // Only attach ParentInfo for fuzz-generated entries (not seeds).
+        // During load_initial_inputs no corpus entry is being fuzzed, so
+        // current_corpus_id() returns None — we use that as the sentinel.
+        if let Some(parent_id) = state.current_corpus_id().ok().flatten() {
+            let parent_file = state
+                .corpus()
+                .get(parent_id)
+                .ok()
+                .and_then(|tc| tc.borrow().filename().clone());
+
+            // MutationLog is only written by LineageMutator. When another stage
+            // finds an interesting input first, fall back to live state counters.
+            let (execs, elapsed_ms) = state
+                .metadata_map()
+                .get::<MutationLog>()
+                .map(|log| (log.execs, log.elapsed_ms))
+                .unwrap_or_else(|| {
+                    let execs = *state.executions();
+                    let elapsed_ms =
+                        (libafl_bolts::current_time() - *state.start_time()).as_millis() as u64;
+                    (execs, elapsed_ms)
+                });
+
+            testcase.add_metadata(ParentInfo {
+                parent_id: Some(usize::from(parent_id) as u64),
+                parent_file,
+                execs,
+                elapsed_ms,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// The fuzzer main (as `no_mangle` C function)
 #[no_mangle]
 pub fn libafl_main() {
-    // Registry the metadata types used in this fuzzer
-    // Needed only on no_std
-    //RegistryBuilder::register::<Tokens>();
-
     let res = match Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author("AFLplusplus team")
@@ -116,7 +296,6 @@ pub fn libafl_main() {
         }
     }
 
-    // For fuzzbench, crashes and finds are inside the same `corpus` directory, in the "queue" and "crashes" subdir.
     let mut out_dir = PathBuf::from(
         res.get_one::<String>("out")
             .expect("The --output parameter is missing")
@@ -157,8 +336,6 @@ pub fn libafl_main() {
 }
 
 fn run_testcases(filenames: &[&str]) {
-    // The actual target run starts here.
-    // Call LLVMFUzzerInitialize() if present.
     let args: Vec<String> = env::args().collect();
     if unsafe { libfuzzer_initialize(&args) } == -1 {
         println!("Warning: LLVMFuzzerInitialize failed with -1")
@@ -195,7 +372,6 @@ fn fuzz(
     #[cfg(unix)]
     let file_null = File::open("/dev/null")?;
 
-    // 'While the monitor are state, they are usually used in the broker - which is likely never restarted
     let monitor = SimpleMonitor::new(|s| {
         #[cfg(unix)]
         writeln!(&mut stdout_cpy, "{}", s).unwrap();
@@ -203,13 +379,10 @@ fn fuzz(
         println!("{}", s);
     });
 
-    // We need a shared map to store our state before a crash.
-    // This way, we are able to continue fuzzing afterwards.
     let mut shmem_provider = StdShMemProvider::new()?;
 
     let (state, mut mgr) = match SimpleRestartingEventManager::launch(monitor, &mut shmem_provider)
     {
-        // The restarting state will spawn the same process again as child, then restarted it each time it crashes.
         Ok(res) => res,
         Err(err) => match err {
             Error::ShuttingDown => {
@@ -221,43 +394,28 @@ fn fuzz(
         },
     };
 
-    // Create an observation channel using the coverage map
-    // We don't use the hitcounts (see the Cargo.toml, we use pcguard_edges)
     let edges_observer =
         HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
 
-    // Create an observation channel to keep track of the execution time
     let time_observer = TimeObserver::new("time");
 
     let cmps = core::ptr::addr_of_mut!(CMP_MAP);
     let cmps_observer = unsafe { StdMapObserver::new("cmps", &mut *cmps) };
 
-    // Feedback to rate the interestingness of an input
-    // This one is composed by two Feedbacks in OR
     let mut feedback = feedback_or!(
-        // New maximization map feedback linked to the edges observer and the feedback state
         MaxMapFeedback::new(&edges_observer),
-        // Cmp max feedback
         MaxMapFeedback::new(&cmps_observer),
-        // Time feedback, this one does not need a feedback state
-        TimeFeedback::new(&time_observer)
+        TimeFeedback::new(&time_observer),
+        LineageFeedback::new()
     );
 
-    // A feedback to choose if an input is a solution or not
     let mut objective = CrashFeedback::new();
 
-    // If not restarting, create a State from scratch
     let mut state = state.unwrap_or_else(|| {
         StdState::new(
-            // RNG
             StdRand::with_seed(current_nanos()),
-            // Corpus that will be evolved, we keep it in memory for performance
             InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
-            // Corpus in which we store solutions (crashes in this example),
-            // on disk so the user can get them after stopping the fuzzer
             OnDiskCorpus::new(objective_dir).unwrap(),
-            // States of the feedbacks.
-            // They are the data related to the feedbacks that you want to persist in the State.
             &mut feedback,
             &mut objective,
         )
@@ -266,24 +424,19 @@ fn fuzz(
 
     println!("Let's fuzz :)");
 
-    // The actual target run starts here.
-    // Call LLVMFUzzerInitialize() if present.
     let args: Vec<String> = env::args().collect();
     if unsafe { libfuzzer_initialize(&args) } == -1 {
         println!("Warning: LLVMFuzzerInitialize failed with -1")
     }
 
-    let mutator = StdMutationalStage::new(StdScheduledMutator::new(
+    let mutator = StdMutationalStage::new(LineageMutator::new(
         havoc_mutations().merge(tokens_mutations()),
     ));
 
-    // A minimization+queue policy to get testcasess from the corpus
     let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
-    // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    // The wrapped harness function, calling out to the LLVM-style harness
     let mut harness = |input: &BytesInput| {
         let target = input.target_bytes();
         let buf = target.as_slice();
@@ -291,7 +444,6 @@ fn fuzz(
         ExitKind::Ok
     };
 
-    // Create the executor for an in-process function with one observer for edge coverage and one for the execution time
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
         tuple_list!(edges_observer, cmps_observer, time_observer),
@@ -301,10 +453,8 @@ fn fuzz(
         timeout,
     )?;
 
-    // The order of the stages matter!
     let mut stages = tuple_list!(mutator);
 
-    // Read tokens
     if state.metadata_map().get::<Tokens>().is_none() {
         let mut toks = Tokens::default();
         if let Some(tokenfile) = tokenfile {
@@ -320,7 +470,6 @@ fn fuzz(
         }
     }
 
-    // In case the corpus is empty (on first run), reset
     if state.corpus().count() < 1 {
         state
             .load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[seed_dir.clone()])
@@ -331,7 +480,6 @@ fn fuzz(
         println!("We imported {} inputs from disk.", state.corpus().count());
     }
 
-    // Remove target ouput (logs still survive)
     #[cfg(unix)]
     {
         let null_fd = file_null.as_raw_fd();
@@ -341,6 +489,5 @@ fn fuzz(
 
     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
-    // Never reached
     Ok(())
 }

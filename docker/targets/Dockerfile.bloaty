@@ -30,6 +30,9 @@ ENV CXX=${FUZZER}_cxx
 # --libafl on EXE_LINKER_FLAGS: links the real LibAFL engine into fuzz_target only.
 ENV CFLAGS="--libafl-no-link"
 ENV CXXFLAGS="--libafl-no-link"
+# Triggers the `if(DEFINED ENV{LIB_FUZZING_ENGINE})` branch in bloaty's CMakeLists.txt
+# which adds the fuzz_target build target. Actual linking is done via --libafl in LDFLAGS.
+ENV LIB_FUZZING_ENGINE=""
 
 # Mirror FuzzBench's build.sh exactly (cmake in $WORK, copy fuzz_target to $OUT)
 RUN cmake -G Ninja \

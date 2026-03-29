@@ -1,1 +1,9 @@
-./docker/run_experiments.sh --fuzzers "cmplog" --targets "bloaty" --trials 2 --duration 10
+./docker/run_experiments.sh --fuzzers "naive" --targets "mbedtls" --trials 2 --duration 60
+tmux new -s fuzz
+./docker/run_experiments.sh \
+    --fuzzers "naive cmplog value_profile value_profile_cmplog" \
+    --targets "bloaty lcms libpcap sqlite3 mbedtls" \
+    --trials 3 \
+    --duration 43200
+
+  Then detach with Ctrl-b d. Reattach later with tmux attach -t fuzz.
