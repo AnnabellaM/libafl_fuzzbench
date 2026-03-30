@@ -43,17 +43,27 @@ docker build \
     .
 
 # ── step 2: build per-(fuzzer, target) images ────────────────────────────────
+failed_builds=()
 for target in $TARGETS; do
     for fuzzer in $FUZZERS; do
         image="libafl-${target}-${fuzzer}"
         echo "==> Building ${image}..."
-        docker build \
+        if ! docker build \
             --build-arg FUZZER="${fuzzer}" \
             -f "docker/targets/Dockerfile.${target}" \
             -t "${image}" \
-            .
+            .; then
+            echo "!!! Build failed for ${image}, skipping."
+            failed_builds+=("${image}")
+        fi
     done
 done
+
+if [[ ${#failed_builds[@]} -gt 0 ]]; then
+    echo ""
+    echo "==> The following images failed to build and will be skipped:"
+    for img in "${failed_builds[@]}"; do echo "    ${img}"; done
+fi
 
 # ── step 3: launch experiments ───────────────────────────────────────────────
 # Assign each container its own CPU core to avoid interference.
@@ -68,6 +78,11 @@ for target in $TARGETS; do
             corpus="${RESULTS_DIR}/${target}/${fuzzer}/trial${trial}"
             seeds="${SEEDS_DIR}/${target}"
 
+            # Skip if the image failed to build
+            if [[ " ${failed_builds[*]} " == *" ${image} "* ]]; then
+                continue
+            fi
+
             mkdir -p "$corpus"
 
             echo "==> Starting ${name} on CPU ${cpu}..."
@@ -78,15 +93,15 @@ for target in $TARGETS; do
                 seed_vol=(-v "${seeds}:/seeds:ro")
             fi
 
-            docker run -d \
+            cid=$(docker run -d \
                 --name "${name}" \
                 --cpuset-cpus "${cpu}" \
                 --memory "4g" \
                 -v "${corpus}:/corpus" \
                 "${seed_vol[@]}" \
                 -e DURATION="${DURATION}" \
-            "${image}" \
-                2>&1 | tee "${RESULTS_DIR}/${name}.log" &
+            "${image}")
+            docker logs -f "${cid}" 2>&1 | tee "${RESULTS_DIR}/${name}.log" &
 
             pids+=($!)
             (( cpu++ )) || true

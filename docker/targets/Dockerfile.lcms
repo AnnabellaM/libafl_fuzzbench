@@ -45,9 +45,7 @@ RUN mkdir -p /fuzz /corpus /seeds && \
         -I include/ src/.libs/liblcms2.a \
         -o /fuzz/cms_transform_fuzzer
 
-# Use a real ICC profile from the repo as seed, fall back to magic bytes
-RUN find /src/Little-CMS -name "*.icc" | head -1 | xargs -I{} cp {} /seeds/seed.icc 2>/dev/null || \
-    printf '\x00\x00\x00\x0cLCMS\x00\x00\x00\x00' > /seeds/seed.icc
+# Seed is provided via ./docker/seeds/lcms/ (a real ICC profile).
 
 ENV DURATION=86400
 
