@@ -17,6 +17,13 @@ docker build -f docker/targets/Dockerfile.bloaty.cov -t libafl-bloaty-cov .
 Then stop the current slow container and rerun:
 
 docker stop $(docker ps -q --filter ancestor=libafl-bloaty-cov)
-./docker/run_coverage.sh --targets "sqlite3"
+./docker/run_coverage.sh --targets "lcms"
 
 docker run --rm --entrypoint sh libafl-bloaty-cov -c "find /work/build/CMakeFiles/libbloaty.dir -name '*.o' | head -1 | xargs llvm-nm-18 | grep covrec | head -3"
+
+
+python3 docker/plot_coverage_timeseries.py --target sqlite3 --fuzzers naive cmplog value_profile value_profile_cmplog --trials 3 --out out/sqlite3_coverage.png
+
+./docker/run_coverage_timeseries.sh --targets sqlite3 --interval 30
+./docker/run_coverage_timeseries.sh --targets libpcap --interval 30
+./docker/run_coverage_timeseries.sh --targets mbedtls --interval 30

@@ -4,9 +4,9 @@ Time-series coverage entrypoint.
 
 Reads LibAFL corpus metadata to extract per-input timestamps (elapsed_ms),
 then replays inputs in chronological order and records branch coverage at
-regular checkpoints.  Outputs a CSV:
+regular checkpoints.  Outputs two CSVs:
 
-    time_s, branch_covered, branch_total
+    coverage_timeseries.csv     — time_s, branch_covered, branch_total
 
 Usage (inside container):
     python3 /run_coverage_timeseries.py /corpus /cov_out [interval_min]
@@ -88,7 +88,6 @@ def get_branch_coverage(running: str):
     for line in reversed(r.stdout.splitlines()):
         if line.startswith("TOTAL"):
             parts = line.split()
-            # TOTAL ... Regions MissedR Cover% Funcs MissedF Exec% Lines MissedL Cover% Branches MissedB BranchCover%
             try:
                 total   = int(parts[-3])
                 missed  = int(parts[-2])
@@ -127,7 +126,8 @@ checkpoints  = list(range(interval_ms, max_elapsed_ms + interval_ms, interval_ms
 
 # 3. Replay in checkpoint windows (incremental)
 running = os.path.join(profraw_dir, "running.profdata")
-results = []  # (time_s, covered, total)
+results = []          # (time_s, covered, total)
+
 prev_idx   = 0
 batch_num  = 0
 have_data  = False
@@ -149,9 +149,11 @@ for cp_ms in checkpoints:
         have_data = True
 
     if have_data:
+        time_s = cp_ms // 1000
+
         covered, total = get_branch_coverage(running)
         if covered is not None:
-            results.append((cp_ms // 1000, covered, total))
+            results.append((time_s, covered, total))
             pct = 100 * covered / total if total else 0
             print(f"    branch coverage: {covered}/{total} = {pct:.2f}%", flush=True)
 
@@ -161,5 +163,4 @@ with open(csv_path, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["time_s", "branch_covered", "branch_total"])
     w.writerows(results)
-
-print(f"\nDone. Results written to {csv_path}")
+print(f"\nTimeseries written to {csv_path}")
