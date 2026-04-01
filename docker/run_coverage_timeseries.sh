@@ -74,6 +74,4 @@ done
 
 echo ""
 echo "==> Done. Reports under ${COV_DIR}/"
-find "${COV_DIR}" -name "coverage_timeseries.csv" | sort | while read -r f; do
-    echo "  ${f}"
 done

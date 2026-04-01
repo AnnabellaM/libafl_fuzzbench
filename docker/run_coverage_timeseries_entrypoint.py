@@ -33,6 +33,11 @@ os.makedirs(OUT_DIR, exist_ok=True)
 profraw_dir = os.path.join(OUT_DIR, "profraw_ts")
 os.makedirs(profraw_dir, exist_ok=True)
 
+# Clean stale profdata from any previous run so coverage accumulates from scratch
+_stale = os.path.join(profraw_dir, "running.profdata")
+if os.path.exists(_stale):
+    os.remove(_stale)
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -78,13 +83,29 @@ def merge_into_running(new_profraw: str, running: str) -> None:
     )
 
 
-def get_branch_coverage(running: str):
-    """Run llvm-cov report and return (branch_covered, branch_total) or (None, None)."""
+def get_branch_coverage(running: str, report_dir: str = None):
+    """Run llvm-cov report and return (branch_covered, branch_total) or (None, None).
+    If report_dir is given, save full summary and show reports there."""
     r = subprocess.run(
         ["llvm-cov-18", "report", FUZZ_BIN,
          f"-instr-profile={running}", "--show-branch-summary"],
         capture_output=True, text=True,
     )
+
+    if report_dir is not None:
+        os.makedirs(report_dir, exist_ok=True)
+        with open(os.path.join(report_dir, "branch_coverage_summary.txt"), "w") as f:
+            f.write(r.stdout)
+
+        show = subprocess.run(
+            ["llvm-cov-18", "show", FUZZ_BIN,
+             f"-instr-profile={running}",
+             "-show-branches=count", "-show-line-counts", "-format=text"],
+            capture_output=True, text=True,
+        )
+        with open(os.path.join(report_dir, "branch_coverage_show.txt"), "w") as f:
+            f.write(show.stdout)
+
     for line in reversed(r.stdout.splitlines()):
         if line.startswith("TOTAL"):
             parts = line.split()
@@ -150,8 +171,9 @@ for cp_ms in checkpoints:
 
     if have_data:
         time_s = cp_ms // 1000
+        report_dir = os.path.join(OUT_DIR, "reports", str(time_s))
 
-        covered, total = get_branch_coverage(running)
+        covered, total = get_branch_coverage(running, report_dir)
         if covered is not None:
             results.append((time_s, covered, total))
             pct = 100 * covered / total if total else 0

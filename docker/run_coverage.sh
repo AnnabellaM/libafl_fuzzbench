@@ -71,6 +71,4 @@ done
 
 echo ""
 echo "==> Done. Reports under ${COV_DIR}/"
-find "${COV_DIR}" -name "branch_coverage.txt" | sort | while read -r f; do
-    echo "  ${f}"
 done
