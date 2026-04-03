@@ -1,0 +1,15 @@
+FROM libafl-coverage-base
+
+# Python + agent dependencies
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir anthropic>=0.40.0
+
+# Copy agent code
+COPY agent_fuzzer/agent/ /agent/
+
+# The per-target Dockerfile sets FUZZ_BIN.
+# The agent is invoked with agent_dir as first argument.
+ENTRYPOINT ["python3", "/agent/run.py"]

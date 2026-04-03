@@ -1,0 +1,28 @@
+# Negative rules: branches to skip (noise, error handling, logging)
+# Each line is a substring matched against the source context around the branch.
+# Lines starting with / and ending with / are treated as regex patterns.
+# Add your own rules below.
+
+# --- Error handling ---
+fprintf(stderr
+perror(
+__assert_fail
+abort()
+exit(1)
+exit(-1)
+_exit(
+
+# --- Logging / debug ---
+printf("error
+printf("Error
+printf("ERR
+debug_print
+LOG_ERR
+syslog(
+
+# --- Memory allocation failure ---
+== NULL
+malloc(
+realloc(
+calloc(
+out of memory
