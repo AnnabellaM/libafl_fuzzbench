@@ -1,5 +1,5 @@
 [package]
-name = "cov_accounting"
+name = "minimizer"
 version = "0.0.1"
 authors = ["Andrea Fioraldi <andreafioraldi@gmail.com>", "Dominik Maier <domenukk@gmail.com>"]
 edition = "2021"

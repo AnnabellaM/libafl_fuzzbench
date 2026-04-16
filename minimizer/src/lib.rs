@@ -2,6 +2,7 @@
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
 use libafl::observers::CanTrack;
 use libafl::HasMetadata;
 use libafl_bolts::{
@@ -43,14 +44,12 @@ use libafl::{
         Mutator, MutatorsTuple, Tokens,
     },
     observers::{HitcountsMapObserver, TimeObserver},
-    schedulers::{powersched::SchedulerMetadata, CoverageAccountingScheduler, QueueScheduler},
+    schedulers::{powersched::SchedulerMetadata, IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{power::StdPowerMutationalStage, CalibrationStage},
     state::{HasCorpus, HasExecutions, HasRand, HasStartTime, StdState},
     Error,
 };
-use libafl_targets::{
-    libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer, ACCOUNTING_MEMOP_MAP,
-};
+use libafl_targets::{libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
@@ -421,8 +420,8 @@ fn fuzz(
     });
 
     // StdPowerMutationalStage + CalibrationStage require SchedulerMetadata in
-    // state; CoverageAccountingScheduler(QueueScheduler) never inserts it. See
-    // weighted.rs:131 where StdWeightedScheduler does the same call.
+    // state; QueueScheduler (wrapped here) never inserts it. See weighted.rs:131
+    // where StdWeightedScheduler does the same call.
     if !state.has_metadata::<SchedulerMetadata>() {
         state.add_metadata(SchedulerMetadata::new(None));
     }
@@ -441,12 +440,7 @@ fn fuzz(
         StdPowerMutationalStage::new(mutator);
 
     // A minimization+queue policy to get testcasess from the corpus
-    let scheduler = CoverageAccountingScheduler::new(
-        &edges_observer,
-        &mut state,
-        QueueScheduler::new(),
-        unsafe { &*core::ptr::addr_of_mut!(ACCOUNTING_MEMOP_MAP) },
-    );
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
     // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.4
 # Single stage: build environment is also the runtime.
 # The LLVM pass .so files built by cargo have their paths baked into the
 # compiler wrapper binaries, so we can't strip the build tree out.

@@ -73,12 +73,20 @@ const STATS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15);
 /// Metadata stored in shared state to persist plateau detection across restarts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, SerdeAny)]
 struct PlateauMetadata {
-    /// Corpus count at last observed growth.
-    last_corpus_count: usize,
+    /// Number of unique edges hit at last observed growth.
+    last_edge_count: usize,
     /// Unix timestamp (secs) when we last saw growth.
     last_growth_timestamp: u64,
     /// Number of agent cycles completed.
     agent_cycle: u64,
+}
+
+/// Count the number of unique edges hit in the global edges map.
+/// This is the true coverage signal — independent of hitcount buckets / corpus size.
+fn count_edges() -> usize {
+    use libafl_bolts::AsSlice;
+    let map = unsafe { libafl_targets::edges_map_mut_slice() };
+    map.as_slice().iter().filter(|&&b| b != 0).count()
 }
 
 fn now_secs() -> u64 {
@@ -601,7 +609,7 @@ fn fuzz(
     // Initialize or recover plateau metadata from shared state
     if state.metadata_map().get::<PlateauMetadata>().is_none() {
         state.add_metadata(PlateauMetadata {
-            last_corpus_count: state.corpus().count(),
+            last_edge_count: count_edges(),
             last_growth_timestamp: now_secs(),
             agent_cycle: 0,
         });
@@ -616,21 +624,21 @@ fn fuzz(
         mgr.maybe_report_progress(&mut state, STATS_TIMEOUT_DEFAULT)?;
         fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
-        // Check if corpus grew (new coverage found)
-        let current_count = state.corpus().count();
+        // Check if edge coverage grew (true coverage signal, not corpus count)
+        let current_edges = count_edges();
         let meta = state.metadata_map().get::<PlateauMetadata>().unwrap();
-        let prev_count = meta.last_corpus_count;
+        let prev_edges = meta.last_edge_count;
         let last_growth_ts = meta.last_growth_timestamp;
         let agent_cycle = meta.agent_cycle;
 
-        if current_count > prev_count {
+        if current_edges > prev_edges {
             let meta = state.metadata_map_mut().get_mut::<PlateauMetadata>().unwrap();
-            meta.last_corpus_count = current_count;
+            meta.last_edge_count = current_edges;
             meta.last_growth_timestamp = now_secs();
             continue;
         }
 
-        // Plateau detection: no new coverage for `plateau_duration`
+        // Plateau detection: no new edges hit for `plateau_duration`
         let elapsed_secs = now_secs().saturating_sub(last_growth_ts);
         if elapsed_secs >= agent_config.plateau_duration.as_secs() {
             let new_cycle = agent_cycle + 1;
@@ -638,8 +646,8 @@ fn fuzz(
             // Use stderr since stdout may be suppressed
             eprintln!(
                 "[Agent Fuzzer] Coverage plateau detected (cycle {}). \
-                 Corpus size: {}. No growth for {}s. Entering agent phase.",
-                new_cycle, current_count, elapsed_secs,
+                 Edges hit: {}. No new edges for {}s. Entering agent phase.",
+                new_cycle, current_edges, elapsed_secs,
             );
 
             // Phase 1: Export seeds for the agent
@@ -660,15 +668,19 @@ fn fuzz(
                 &agent_config.agent_dir,
             )?;
 
+            // Clean up IPC files so the host watcher doesn't re-trigger
+            let _ = fs::remove_file(agent_config.agent_dir.join("request.json"));
+            let _ = fs::remove_file(agent_config.agent_dir.join("done"));
+
             eprintln!(
                 "[Agent Fuzzer] Agent phase complete (cycle {}). Imported {} seeds. Resuming fuzzing.",
                 new_cycle, imported,
             );
 
-            // Reset plateau timer
-            let new_count = state.corpus().count();
+            // Reset plateau timer — measure edges after agent seeds were executed
+            let new_edges = count_edges();
             let meta = state.metadata_map_mut().get_mut::<PlateauMetadata>().unwrap();
-            meta.last_corpus_count = new_count;
+            meta.last_edge_count = new_edges;
             meta.last_growth_timestamp = now_secs();
             meta.agent_cycle = new_cycle;
         }

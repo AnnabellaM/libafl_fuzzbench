@@ -1,306 +1,508 @@
-"""LLVM coverage collection, branch analysis, and seed verification."""
+"""Docker-backed coverage: per-seed branch mapping, source extraction, verify."""
 
 import json
 import os
+import re
+import shutil
 import subprocess
-import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+
+SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+PER_SEED_SCRIPT = SCRIPTS_DIR / "cov_per_seed.sh"
 
 
-LLVM_PROFDATA = os.environ.get("LLVM_PROFDATA", "llvm-profdata-18")
-LLVM_COV = os.environ.get("LLVM_COV", "llvm-cov-18")
-
-
-@dataclass
+@dataclass(frozen=True)
 class Branch:
-    """A single branch point in the target program."""
-
     file: str
     line_start: int
     col_start: int
     line_end: int
     col_end: int
-    true_count: int
-    false_count: int
 
     @property
     def id(self) -> str:
         return f"{self.file}:{self.line_start}:{self.col_start}"
 
-    @property
-    def is_frontier(self) -> bool:
-        """One side taken, other side never taken."""
-        return (self.true_count > 0) != (self.false_count > 0)
 
-    @property
-    def missing_side(self) -> str:
-        """Which side has count == 0."""
-        return "true" if self.true_count == 0 else "false"
-
-    @property
-    def hit_count(self) -> int:
-        """Count on the taken side."""
-        return max(self.true_count, self.false_count)
+@dataclass
+class VerifyResult:
+    """Richer per-candidate signal — lets strategies (and invention) reason
+    about HOW close a candidate got, not just pass/fail."""
+    flipped: bool              # hit the missing side (success)
+    took_opposite: bool        # hit the non-missing side (reached branch, wrong path)
+    reached_func: bool         # any branch in enclosing function was hit
+    missing_side_count: int
+    opposite_side_count: int
+    func_branches_hit: int     # how many branches in the enclosing func had count>0
 
 
-# ---------------------------------------------------------------------------
-# Coverage collection
-# ---------------------------------------------------------------------------
+def image_name(target: str) -> str:
+    return f"agent-cov-{target}"
 
 
-def run_seeds_coverage(
-    fuzz_bin: str,
-    seed_paths: list[str],
-    work_dir: Path,
-    batch_size: int = 500,
-    log_fn=print,
-) -> Path:
-    """Run seeds against coverage binary, merge profiles, return profdata path.
+def _image_exists(name: str) -> bool:
+    r = subprocess.run(
+        ["docker", "image", "inspect", name],
+        capture_output=True,
+    )
+    return r.returncode == 0
 
-    The binary must be compiled with -fprofile-instr-generate -fcoverage-mapping
-    and linked with -fsanitize=fuzzer (libfuzzer entry point for replay).
-    """
-    profraw_dir = work_dir / "profraw"
-    profraw_dir.mkdir(parents=True, exist_ok=True)
 
-    # Run in batches
-    batch = 0
-    for i in range(0, len(seed_paths), batch_size):
-        batch_files = seed_paths[i : i + batch_size]
-        profraw_path = profraw_dir / f"{batch}.profraw"
-        env = os.environ.copy()
-        env["LLVM_PROFILE_FILE"] = str(profraw_path)
-        try:
-            subprocess.run(
-                [fuzz_bin] + batch_files,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-            pass  # some seeds may crash, that's fine
-        batch += 1
+def ensure_image(target: str, repo_root: Path, log=print) -> str:
+    """Ensure agent-cov-<target> exists; build it (and base) if missing."""
+    tag = image_name(target)
+    if _image_exists(tag):
+        log(f"[cov] reusing image {tag}")
+        return tag
 
-    log_fn(f"Ran {batch} batches across {len(seed_paths)} seeds")
+    base_dockerfile = repo_root / "docker" / "Dockerfile.coverage-base"
+    target_dockerfile = repo_root / "docker" / "targets" / f"Dockerfile.{target}.cov"
+    if not target_dockerfile.exists():
+        raise FileNotFoundError(f"missing {target_dockerfile}")
 
-    # Merge profiles
-    profdata_path = work_dir / "merged.profdata"
-    profraw_files = list(profraw_dir.glob("*.profraw"))
-    if not profraw_files:
-        log_fn("WARNING: No profraw files generated")
-        return profdata_path
+    if not _image_exists("libafl-coverage-base"):
+        log("[cov] building libafl-coverage-base...")
+        subprocess.run(
+            ["docker", "build", "-f", str(base_dockerfile),
+             "-t", "libafl-coverage-base", str(repo_root)],
+            check=True,
+        )
 
+    log(f"[cov] building {tag} from {target_dockerfile.name}...")
     subprocess.run(
-        [LLVM_PROFDATA, "merge", "-sparse"]
-        + [str(f) for f in profraw_files]
-        + ["-o", str(profdata_path)],
+        ["docker", "build", "-f", str(target_dockerfile),
+         "-t", tag, str(repo_root)],
         check=True,
     )
-    log_fn(f"Merged {len(profraw_files)} profiles → {profdata_path}")
-    return profdata_path
+    return tag
 
 
-# ---------------------------------------------------------------------------
-# Branch extraction
-# ---------------------------------------------------------------------------
+# ── per-seed coverage ──────────────────────────────────────────────────────
+
+def run_per_seed_coverage(
+    target: str,
+    seeds_dir: Path,
+    out_dir: Path,
+    log=print,
+) -> Path:
+    """Run the per-seed coverage container, return the dir of per-seed JSONs."""
+    tag = image_name(target)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Clean prior run's json dir so stale files don't leak
+    json_dir = out_dir / "json"
+    if json_dir.exists():
+        shutil.rmtree(json_dir)
+
+    cmd = [
+        "docker", "run", "--rm",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-v", f"{seeds_dir}:/seeds:ro",
+        "-v", f"{out_dir}:/out",
+        "-v", f"{PER_SEED_SCRIPT}:/cov_per_seed.sh:ro",
+        "--entrypoint", "/cov_per_seed.sh",
+        tag,
+        "/seeds", "/out",
+    ]
+    log(f"[cov] per-seed container: {len(list(seeds_dir.iterdir()))} seeds")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.stdout.strip():
+        log(f"  {r.stdout.strip()}")
+    if r.returncode != 0:
+        log(f"  container exit={r.returncode} stderr={r.stderr[:500]}")
+    return json_dir
 
 
-def export_branches_json(fuzz_bin: str, profdata_path: Path) -> list[Branch]:
-    """Run llvm-cov export and parse branch data from JSON."""
-    result = subprocess.run(
-        [
-            LLVM_COV, "export",
-            fuzz_bin,
-            f"-instr-profile={profdata_path}",
-            "--format=json",
-            "--show-branch-summary",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    data = json.loads(result.stdout)
+def parse_per_seed_jsons(
+    json_dir: Path,
+    source_filter: str | None = None,
+) -> tuple[dict[str, Branch], dict[str, dict[str, tuple[int, int]]]]:
+    """Return (branch_index, per_seed_counts).
 
-    branches = []
-    for entry in data.get("data", []):
-        for file_data in entry.get("files", []):
-            filename = file_data.get("filename", "")
-            for br in file_data.get("branches", []):
-                # Branch format: [line_start, col_start, line_end, col_end,
-                #                  exec_count, false_count, ...]
-                if len(br) >= 6:
-                    branches.append(Branch(
-                        file=filename,
-                        line_start=br[0],
-                        col_start=br[1],
-                        line_end=br[2],
-                        col_end=br[3],
-                        true_count=br[4],
-                        false_count=br[5],
-                    ))
-    return branches
-
-
-def get_source_report(fuzz_bin: str, profdata_path: Path) -> str:
-    """Run llvm-cov show for human/LLM-readable source-annotated report."""
-    result = subprocess.run(
-        [
-            LLVM_COV, "show",
-            fuzz_bin,
-            f"-instr-profile={profdata_path}",
-            "-show-branches=count",
-            "-show-line-counts",
-            "-format=text",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout
-
-
-def find_frontier_branches(branches: list[Branch]) -> list[Branch]:
-    """Filter for one-sided branches (coverage frontier)."""
-    return [b for b in branches if b.is_frontier]
-
-
-# ---------------------------------------------------------------------------
-# Source context extraction
-# ---------------------------------------------------------------------------
-
-
-def extract_source_context(
-    source_report: str,
-    branch: Branch,
-    context_lines: int = 30,
-) -> str:
-    """Extract source context around a branch from llvm-cov show output.
-
-    Returns annotated source lines (with hit counts) centered on the branch.
+    branch_index: id -> Branch
+    per_seed_counts: seed_name -> id -> (true, false)
     """
-    # Find the file section in the report
-    lines = source_report.split("\n")
-    in_file = False
-    file_lines = []
+    branch_index: dict[str, Branch] = {}
+    per_seed: dict[str, dict[str, tuple[int, int]]] = {}
+    if not json_dir.is_dir():
+        return branch_index, per_seed
 
-    for line in lines:
-        # llvm-cov show outputs file headers like: /path/to/file.c:
-        if line.strip().endswith(":") and branch.file in line:
-            in_file = True
-            file_lines = []
+    for jf in sorted(json_dir.iterdir()):
+        if not jf.is_file() or not jf.name.endswith(".json"):
             continue
-        if in_file:
-            # End of file section (next file header or summary)
-            if line.strip().endswith(":") and "/" in line and not line.strip().startswith("|"):
-                break
-            file_lines.append(line)
+        seed_name = jf.name[:-5]
+        try:
+            data = json.loads(jf.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        counts: dict[str, tuple[int, int]] = {}
+        for entry in data.get("data", []):
+            for fd in entry.get("files", []):
+                fname = fd.get("filename", "")
+                if source_filter and source_filter not in fname:
+                    continue
+                for br in fd.get("branches", []):
+                    if len(br) < 6:
+                        continue
+                    b = Branch(fname, br[0], br[1], br[2], br[3])
+                    branch_index[b.id] = b
+                    counts[b.id] = (int(br[4]), int(br[5]))
+        per_seed[seed_name] = counts
+    return branch_index, per_seed
 
-    if not file_lines:
-        # Fallback: try to read the source file directly
-        return _read_source_context(branch, context_lines)
 
-    # Find the branch line and extract context window
-    target_line = branch.line_start
-    # llvm-cov show lines are formatted as: "  LINE_NUM|  COUNT|source"
-    start = max(0, target_line - context_lines - 1)
-    end = min(len(file_lines), target_line + context_lines)
-    context = file_lines[start:end]
+def find_blockers(
+    branch_index: dict[str, Branch],
+    per_seed: dict[str, dict[str, tuple[int, int]]],
+) -> list[tuple[Branch, str, list[str]]]:
+    """One-sided branches. Returns [(branch, missing_side, side_a_seed_names), ...].
 
-    return f"=== {branch.file} around line {target_line} ===\n" + "\n".join(context)
+    Unordered — prioritize_blockers() should be called to rank.
+    """
+    total: dict[str, tuple[int, int]] = {}
+    for counts in per_seed.values():
+        for bid, (t, f) in counts.items():
+            pt, pf = total.get(bid, (0, 0))
+            total[bid] = (pt + t, pf + f)
+
+    blockers = []
+    for bid, (t, f) in total.items():
+        if (t > 0) == (f > 0):
+            continue
+        missing = "true" if t == 0 else "false"
+        taken = "false" if missing == "true" else "true"
+        side_a = [
+            name for name, cc in per_seed.items()
+            if ((taken == "true" and cc.get(bid, (0, 0))[0] > 0) or
+                (taken == "false" and cc.get(bid, (0, 0))[1] > 0))
+        ]
+        blockers.append((branch_index[bid], missing, side_a))
+    return blockers
 
 
-def _read_source_context(branch: Branch, context_lines: int = 30) -> str:
-    """Read raw source context directly from the file."""
+# ── Negative-rule filter ───────────────────────────────────────────────────
+
+# Path fragments that indicate non-productive code (generated, test scaffolding).
+_PATH_EXCLUDES = ["/build/", "/testprogs/", "/tests/", "/test/",
+                  "/fuzzing/", "/examples/", "/third_party/"]
+
+# Lines matching any of these patterns are likely unproductive blockers:
+# null-pointer checks (unreachable from harness), assertions, error returns.
+_NEGATIVE_PATTERNS = [
+    re.compile(r"==\s*(NULL|nullptr)\b"),
+    re.compile(r"!=\s*(NULL|nullptr)\b"),
+    re.compile(r"\bassert\s*\("),
+    re.compile(r"\babort\s*\("),
+    re.compile(r"\bpanic\s*\("),
+    re.compile(r"\b_?exit\s*\("),
+    re.compile(r"\bfatal\w*\s*\("),
+    re.compile(r"return\s+(-1|NULL|nullptr|false)\b"),
+    # pointer == 0 idioms like `if (pc == 0)` for named pointer-ish vars
+    re.compile(r"\bif\s*\(\s*\w*(ptr|p|pc|buf|ctx|handle|fp)\s*==\s*0\s*\)", re.I),
+    re.compile(r"\bif\s*\(\s*!\s*\w+\s*\)"),
+]
+
+
+_SEMANTIC_COMMENT_RE = re.compile(r"/\*|//")
+_UPPER_IDENT_RE = re.compile(r"\b[A-Z_][A-Z0-9_]{3,}\b")
+_STRING_CMP_RE = re.compile(
+    r"(memcmp|strncmp|strcmp|strncasecmp|strcasecmp)\s*\(|==\s*[\"']"
+)
+_CASE_RE = re.compile(r"\bcase\s+[^:]+:")
+_NAMED_EQ_RE = re.compile(r"==\s*[A-Z_][A-Z0-9_]*\b")
+
+
+def semantic_affinity(window: str) -> int:
+    """Score how answerable a blocker is via semantic_guess (source reading)."""
+    s = 0
+    if _SEMANTIC_COMMENT_RE.search(window):
+        s += 2
+    if _NAMED_EQ_RE.search(window):
+        s += 2
+    if _STRING_CMP_RE.search(window):
+        s += 1
+    if _CASE_RE.search(window):
+        s += 1
+    if _UPPER_IDENT_RE.search(window):
+        s += 1
+    return s
+
+
+def prioritize_blockers(
+    blockers: list[tuple[Branch, str, list[str]]],
+    line_fetcher,
+    window_fetcher,
+    corpus_size: int,
+    log=print,
+) -> list[tuple[Branch, str, list[str], int]]:
+    """Filter out unproductive blockers, rank the rest.
+
+    Returns [(branch, missing_side, side_a, affinity), ...] sorted.
+
+    line_fetcher(branch) -> single branch line
+    window_fetcher(branch) -> multi-line context around the branch
+    """
+    kept_path = []
+    drop_path = 0
+    for b, m, sa in blockers:
+        if any(p in b.file for p in _PATH_EXCLUDES):
+            drop_path += 1
+            continue
+        kept_path.append((b, m, sa))
+
+    kept_ratio = []
+    drop_ratio = 0
+    # Skip ratio filter for tiny corpora — 0.9*N rounds down to cover every
+    # blocker, and the "nearly all seeds reach side-A" inference is meaningless
+    # without a decent sample size.
+    if corpus_size >= 10:
+        ceil = int(corpus_size * 0.9)
+        for b, m, sa in kept_path:
+            if len(sa) >= ceil:
+                drop_ratio += 1
+                continue
+            kept_ratio.append((b, m, sa))
+    else:
+        kept_ratio = kept_path
+
+    kept_neg = []
+    drop_neg = 0
+    scored: list[tuple[Branch, str, list[str], int]] = []
+    for b, m, sa in kept_ratio:
+        try:
+            line = line_fetcher(b)
+        except Exception:
+            line = ""
+        if any(p.search(line) for p in _NEGATIVE_PATTERNS):
+            drop_neg += 1
+            continue
+        kept_neg.append((b, m, sa))
+        try:
+            win = window_fetcher(b)
+        except Exception:
+            win = line
+        scored.append((b, m, sa, semantic_affinity(win)))
+
+    log(f"[cov] prioritize: drop path={drop_path} ratio={drop_ratio} "
+        f"neg={drop_neg}  kept={len(scored)}/{len(blockers)}")
+
+    mid = corpus_size / 2.0
+    scored.sort(key=lambda x: (-x[3], abs(len(x[2]) - mid), x[0].id))
+    return scored
+
+
+# Back-compat shim; new code should use prioritize_blockers.
+def filter_negative_blockers(blockers, source_fetcher, log=print):
+    kept = []
+    dropped = 0
+    for br, miss, sa in blockers:
+        try:
+            line = source_fetcher(br)
+        except Exception:
+            line = ""
+        if any(p.search(line) for p in _NEGATIVE_PATTERNS):
+            dropped += 1
+            continue
+        kept.append((br, miss, sa))
+    return kept, dropped
+
+
+# ── source extraction (cached) ─────────────────────────────────────────────
+
+def prefetch_source_tree(
+    target: str, container_root: str, cache_dir: Path, log=print,
+) -> bool:
+    """Extract the source tree under container_root into cache_dir in ONE docker run.
+
+    Creates a marker file so repeat calls are no-ops. Returns True on success.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    marker = cache_dir / f".prefetched_{container_root.replace('/', '_').lstrip('_')}"
+    if marker.exists():
+        return True
+    tag = image_name(target)
+    log(f"[cov] prefetching {container_root} from {tag}...")
+    # tar the dir from container stdout, untar into cache_dir
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "tar",
+         tag, "-C", "/", "-cf", "-", container_root.lstrip("/")],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        log(f"  prefetch failed: {r.stderr[:300]!r}")
+        return False
+    u = subprocess.run(
+        ["tar", "-xf", "-", "-C", str(cache_dir)],
+        input=r.stdout,
+    )
+    if u.returncode != 0:
+        log("  untar failed")
+        return False
+    marker.touch()
+    return True
+
+
+def fetch_source_file(target: str, container_path: str, cache_dir: Path) -> Path | None:
+    """Return local path for a container source file. Uses prefetch tree if present,
+    falls back to single-file docker cat.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Prefetched layout: <cache_dir>/<container_path_without_leading_slash>
+    tree_local = cache_dir / container_path.lstrip("/")
+    if tree_local.exists():
+        return tree_local
+    # Legacy flat cache key (from single-file cat path)
+    safe = container_path.replace("/", "_").lstrip("_")
+    flat_local = cache_dir / safe
+    if flat_local.exists():
+        return flat_local
+    tag = image_name(target)
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "cat", tag, container_path],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return None
+    flat_local.write_bytes(r.stdout)
+    return flat_local
+
+
+def read_source_context(
+    target: str,
+    branch: Branch,
+    cache_dir: Path,
+    context_lines: int = 25,
+) -> str:
+    local = fetch_source_file(target, branch.file, cache_dir)
+    if not local:
+        return f"[could not fetch {branch.file}]"
     try:
-        with open(branch.file) as f:
-            lines = f.readlines()
-    except (FileNotFoundError, PermissionError):
-        return f"[Could not read source: {branch.file}]"
-
+        lines = local.read_text(errors="replace").splitlines()
+    except OSError:
+        return f"[could not read cached {local}]"
     start = max(0, branch.line_start - context_lines - 1)
     end = min(len(lines), branch.line_start + context_lines)
-    numbered = [
-        f"  {i+1:>5}| {lines[i].rstrip()}"
-        for i in range(start, end)
-    ]
-    marker = f"  >>> FRONTIER BRANCH at line {branch.line_start}, col {branch.col_start}"
-    marker += f" (missing {branch.missing_side} side) <<<"
-
-    # Insert marker near the branch line
-    insert_pos = branch.line_start - start - 1
-    if 0 <= insert_pos < len(numbered):
-        numbered.insert(insert_pos + 1, marker)
-
-    return f"=== {branch.file} ===\n" + "\n".join(numbered)
+    out = []
+    for i in range(start, end):
+        marker = "  >>> " if (i + 1) == branch.line_start else "      "
+        out.append(f"{marker}{i+1:>5}| {lines[i]}")
+    return f"=== {branch.file}:{branch.line_start} ===\n" + "\n".join(out)
 
 
-# ---------------------------------------------------------------------------
-# Seed verification
-# ---------------------------------------------------------------------------
+# ── verification ───────────────────────────────────────────────────────────
 
-
-def verify_seed_hits_branch(
-    fuzz_bin: str,
-    seed_bytes: bytes,
+def verify_candidates_batch(
+    target: str,
+    candidates: list[bytes],
     target_branch: Branch,
+    missing_side: str,
     work_dir: Path,
-) -> bool:
-    """Run a single seed and check if the target branch's missing side is now hit.
+    enclosing_range: tuple[int, int] | None = None,
+) -> list[VerifyResult]:
+    """Run all candidates in one docker container, return per-candidate verify info.
 
-    Returns True if the previously-0 side now has count > 0.
+    enclosing_range=(start_line, end_line) enables the `reached_func` and
+    `func_branches_hit` signals — the coverage pipeline already produces the
+    data; we just slice the branches list by line range.
     """
-    verify_dir = work_dir / "verify"
-    verify_dir.mkdir(parents=True, exist_ok=True)
+    if not candidates:
+        return []
+    work_dir.mkdir(parents=True, exist_ok=True)
+    verify_seeds = work_dir / "seeds"
+    if verify_seeds.exists():
+        shutil.rmtree(verify_seeds)
+    verify_seeds.mkdir()
+    names = []
+    for i, data in enumerate(candidates):
+        name = f"cand_{i:03d}"
+        (verify_seeds / name).write_bytes(data)
+        names.append(name)
 
-    # Write seed to temp file
-    seed_path = verify_dir / "candidate_seed"
-    seed_path.write_bytes(seed_bytes)
+    out_dir = work_dir / "out"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir()
 
-    # Run with coverage
-    profraw_path = verify_dir / "verify.profraw"
-    env = os.environ.copy()
-    env["LLVM_PROFILE_FILE"] = str(profraw_path)
+    tag = image_name(target)
+    r = subprocess.run(
+        [
+            "docker", "run", "--rm",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "-v", f"{verify_seeds}:/seeds:ro",
+            "-v", f"{out_dir}:/out",
+            "-v", f"{PER_SEED_SCRIPT}:/cov_per_seed.sh:ro",
+            "--entrypoint", "/cov_per_seed.sh",
+            tag,
+            "/seeds", "/out",
+        ],
+        capture_output=True, text=True,
+    )
+    empty = lambda: VerifyResult(False, False, False, 0, 0, 0)
+    if r.returncode != 0:
+        return [empty() for _ in candidates]
+
+    results: list[VerifyResult] = []
+    lo, hi = (enclosing_range if enclosing_range
+              else (target_branch.line_start, target_branch.line_start))
+    for name in names:
+        json_file = out_dir / "json" / f"{name}.json"
+        vr = empty()
+        if json_file.exists():
+            try:
+                data = json.loads(json_file.read_text())
+                for d_entry in data.get("data", []):
+                    for fd in d_entry.get("files", []):
+                        if fd.get("filename", "") != target_branch.file:
+                            continue
+                        for br in fd.get("branches", []):
+                            if len(br) < 6:
+                                continue
+                            line, col = br[0], br[1]
+                            t_cnt, f_cnt = br[4], br[5]
+                            # Target-branch accounting
+                            if (line, col) == (target_branch.line_start,
+                                                target_branch.col_start):
+                                miss = t_cnt if missing_side == "true" else f_cnt
+                                opp = f_cnt if missing_side == "true" else t_cnt
+                                vr.missing_side_count = miss
+                                vr.opposite_side_count = opp
+                                vr.flipped = miss > 0
+                                vr.took_opposite = opp > 0
+                            # Enclosing-function accounting
+                            if lo <= line <= hi and (t_cnt > 0 or f_cnt > 0):
+                                vr.func_branches_hit += 1
+                                vr.reached_func = True
+            except json.JSONDecodeError:
+                pass
+        results.append(vr)
+    return results
+
+
+def read_source_line(target: str, branch: Branch, cache_dir: Path) -> str:
+    """Return just the branch's source line (for negative-rule filtering)."""
+    local = fetch_source_file(target, branch.file, cache_dir)
+    if not local:
+        return ""
     try:
-        subprocess.run(
-            [fuzz_bin, str(seed_path)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        )
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        pass
+        lines = local.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    i = branch.line_start - 1
+    return lines[i] if 0 <= i < len(lines) else ""
 
-    if not profraw_path.exists():
-        return False
 
-    # Merge (single file, still needed for llvm-cov)
-    profdata_path = verify_dir / "verify.profdata"
+def read_source_window(
+    target: str, branch: Branch, cache_dir: Path, radius: int = 5,
+) -> str:
+    """Return a small source window (for affinity scoring)."""
+    local = fetch_source_file(target, branch.file, cache_dir)
+    if not local:
+        return ""
     try:
-        subprocess.run(
-            [LLVM_PROFDATA, "merge", "-sparse",
-             str(profraw_path), "-o", str(profdata_path)],
-            check=True,
-            capture_output=True,
-        )
-    except subprocess.CalledProcessError:
-        return False
-
-    # Check branch coverage
-    try:
-        branches = export_branches_json(fuzz_bin, profdata_path)
-    except subprocess.CalledProcessError:
-        return False
-
-    # Find our target branch
-    for b in branches:
-        if b.id == target_branch.id:
-            if target_branch.missing_side == "true":
-                return b.true_count > 0
-            else:
-                return b.false_count > 0
-
-    return False
+        lines = local.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    i = branch.line_start - 1
+    lo = max(0, i - radius)
+    hi = min(len(lines), i + radius + 1)
+    return "\n".join(lines[lo:hi])

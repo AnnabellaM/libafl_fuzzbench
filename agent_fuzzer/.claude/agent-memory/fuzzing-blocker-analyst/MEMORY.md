@@ -1,0 +1,1 @@
+- [libpcap fuzz_both harness format](target_libpcap_fuzz_both.md) — required `\x01\x00`+pcap wrapper, pcapng block constants, high-yield seed shapes

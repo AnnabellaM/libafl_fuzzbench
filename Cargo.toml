@@ -6,6 +6,7 @@ debug = true
 
 [workspace]
 members = [
+    "agent_fuzzer",
     "generic",
     "text",
     "naive", # indexlenmin scheduler
@@ -30,6 +31,7 @@ members = [
     "nautilus_mopt",
     "token_level",
     "weighted",
+    "minimizer",
 ]
 exclude = [
     "LibAFL",

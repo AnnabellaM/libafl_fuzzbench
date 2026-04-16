@@ -44,14 +44,15 @@ echo ""
 echo "Press Ctrl+C to stop."
 echo ""
 
-# Use the LLM agent if ANTHROPIC_API_KEY is set, otherwise manual mode
+# Use the Claude Code agent if `claude` CLI is available, otherwise manual mode
 AGENT_CMD=""
-if [ -n "$ANTHROPIC_API_KEY" ]; then
-    echo "ANTHROPIC_API_KEY is set — using LLM agent automatically."
-    AGENT_CMD="--agent-cmd python3 $SCRIPT_DIR/agent/run.py"
+if command -v claude &>/dev/null; then
+    echo "Claude CLI found — using fuzzing-blocker-analyst agent automatically."
+    AGENT_CMD="--agent-cmd $SCRIPT_DIR/run_agent.sh"
     export TARGET_SOURCE="$SCRIPT_DIR/test_harness.c"
+    export TARGET_NAME="test_harness"
 else
-    echo "No ANTHROPIC_API_KEY — running in manual agent mode."
+    echo "No Claude CLI — running in manual agent mode."
     echo "To simulate the agent manually:"
     echo "  mkdir -p $WORK_DIR/agent_ipc/results"
     echo "  echo -n 'DEEPSEED' > $WORK_DIR/agent_ipc/results/seed_agent_0"
