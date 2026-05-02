@@ -47,8 +47,13 @@ RUN mkdir -p /fuzz /corpus /seeds && \
         /src/libpcap/build/libpcap.a \
         --libafl \
         -o /fuzz/fuzz_both && \
-    # Minimal pcap seed (little-endian magic + v2.4 header, Ethernet linktype)
-    printf '\xd4\xc3\xb2\xa1\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x01\x00\x00\x00' \
+    # Minimal pcap-only seed (24 bytes, little-endian magic + v2.4 header,
+    # Ethernet linktype). Matches the historically-working seed at
+    # docker/seeds/libpcap/seed.pcap. Docker RUN uses /bin/sh (dash) whose
+    # `printf` does NOT interpret `\xNN` — use `printf '%b'` with octals.
+    # fuzz_both.c returns 0 when `filterSize > Size-1` (safe), so this seed
+    # doesn't exercise the filter path but also doesn't crash calibration.
+    printf '%b' '\324\303\262\241\002\000\004\000\000\000\000\000\000\000\000\000\377\377\000\000\001\000\000\000' \
         > /seeds/seed.pcap
 
 ENV DURATION=86400

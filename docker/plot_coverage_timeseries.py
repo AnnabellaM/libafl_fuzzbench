@@ -72,6 +72,30 @@ if global_times and global_times[-1] < global_max_time:
 
 fig, ax = plt.subplots(figsize=(10, 6))
 
+# Group fuzzers into families that share a color ramp:
+#   - mutator/feedback family     → Blues
+#   - scheduler family            → Oranges
+#   - grammar/structure family    → Greens
+FUZZER_GROUPS = {
+    "naive":                ("Blues",   0.45),
+    "cmplog":               ("Blues",   0.65),
+    "value_profile":        ("Blues",   0.80),
+    "value_profile_cmplog": ("Blues",   0.95),
+    "rand_scheduler":       ("Oranges", 0.45),
+    "weighted":             ("Oranges", 0.65),
+    "minimizer":            ("Oranges", 0.80),
+    "cov_accounting":       ("Oranges", 0.95),
+    "grimoire":             ("Greens",  0.80),
+}
+
+
+def fuzzer_color(name):
+    if name in FUZZER_GROUPS:
+        cmap_name, level = FUZZER_GROUPS[name]
+        return plt.get_cmap(cmap_name)(level)
+    return None  # fall back to matplotlib default cycle
+
+
 for fuzzer in args.fuzzers:
     if fuzzer not in all_fuzzer_data:
         print(f"  No data for {fuzzer}, skipping")
@@ -96,8 +120,9 @@ for fuzzer in args.fuzzers:
     lo = matrix.min(axis=0)
     hi = matrix.max(axis=0)
 
-    ax.plot(global_times, mean, label=fuzzer, linewidth=2)
-    ax.fill_between(global_times, lo, hi, alpha=0.15)
+    color = fuzzer_color(fuzzer)
+    ax.plot(global_times, mean, label=fuzzer, linewidth=2, color=color)
+    ax.fill_between(global_times, lo, hi, alpha=0.15, color=color)
 
 ax.set_xlabel("Time (hours)")
 ax.set_ylabel("Branches Covered")

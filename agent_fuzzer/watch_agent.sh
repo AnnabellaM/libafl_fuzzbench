@@ -23,6 +23,11 @@ AGENT_DIR="$(cd "$AGENT_DIR" 2>/dev/null && pwd)" || { echo "Directory $1 does n
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 
+# Bridge script: either the old fuzzing-blocker-analyst prompt (run_agent.sh)
+# or the new Python loop (run_agent_loop.sh). Default: run_agent.sh for
+# back-compat; set AGENT_BRIDGE=run_agent_loop.sh for the loop path.
+AGENT_BRIDGE="${AGENT_BRIDGE:-run_agent.sh}"
+
 REQUEST="$AGENT_DIR/request.json"
 DONE="$AGENT_DIR/done"
 
@@ -38,7 +43,7 @@ while true; do
         echo "[watcher] ============================================"
 
         # Invoke the agent bridge
-        "$SCRIPT_DIR/run_agent.sh" "$AGENT_DIR"
+        "$SCRIPT_DIR/$AGENT_BRIDGE" "$AGENT_DIR"
 
         echo "[watcher] Agent phase complete. Fuzzer will resume."
         echo "[watcher] Resuming watch..."

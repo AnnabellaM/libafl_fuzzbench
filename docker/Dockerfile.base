@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     build-essential cmake ninja-build git curl wget \
     lsb-release software-properties-common gnupg \
     pkg-config python3 \
+    libpython3.10-dev libexpat1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install LLVM 18

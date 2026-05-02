@@ -6,21 +6,25 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 use libafl::observers::CanTrack;
+use libafl::HasMetadata;
 use libafl_bolts::{
     current_nanos,
+    impl_serdeany,
     os::dup2,
-    rands::StdRand,
+    rands::{Rand, StdRand},
     shmem::{ShMemProvider, StdShMemProvider},
-    tuples::tuple_list,
+    tuples::{tuple_list, NamedTuple},
+    Named,
 };
 
 use clap::{Arg, Command};
-use core::time::Duration;
+use core::{num::NonZeroUsize, time::Duration};
 #[cfg(unix)]
 use nix::{self, unistd::dup};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::{
+    borrow::Cow,
     env,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
@@ -28,27 +32,184 @@ use std::{
 };
 
 use libafl::{
-    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
+    corpus::{Corpus, HasCurrentCorpusId, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleRestartingEventManager,
     executors::{inprocess::InProcessExecutor, ExitKind},
     feedback_or,
-    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
+    feedbacks::{CrashFeedback, Feedback, MaxMapFeedback, StateInitializer, TimeFeedback},
     fuzzer::StdFuzzer,
     generators::{Automaton, GramatronGenerator},
     inputs::GramatronInput,
     monitors::SimpleMonitor,
     mutators::{
         GramatronRandomMutator, GramatronRecursionMutator, GramatronSpliceMutator,
-        StdScheduledMutator,
+        LogMutationMetadata, MutationResult, Mutator, MutatorsTuple,
     },
     observers::{HitcountsMapObserver, TimeObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::mutational::StdMutationalStage,
-    state::{HasCorpus, StdState},
+    state::{HasCorpus, HasExecutions, HasRand, HasStartTime, StdState},
     Error, Fuzzer,
 };
 
 use libafl_targets::{libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer};
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Lineage tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct MutationLog {
+    pub names: Vec<Cow<'static, str>>,
+    pub execs: u64,
+    pub elapsed_ms: u64,
+}
+impl_serdeany!(MutationLog);
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ParentInfo {
+    pub parent_id: Option<u64>,
+    pub parent_file: Option<String>,
+    pub execs: u64,
+    pub elapsed_ms: u64,
+}
+impl_serdeany!(ParentInfo);
+
+pub struct LineageMutator<MT> {
+    name: Cow<'static, str>,
+    mutations: MT,
+    max_stack_pow: NonZeroUsize,
+}
+
+impl<MT: NamedTuple> LineageMutator<MT> {
+    pub fn new(mutations: MT) -> Self {
+        Self::with_max_stack_pow(mutations, 7)
+    }
+
+    pub fn with_max_stack_pow(mutations: MT, pow: usize) -> Self {
+        Self {
+            name: Cow::from(format!("LineageMutator[{}]", mutations.names().join(", "))),
+            mutations,
+            max_stack_pow: NonZeroUsize::new(pow).unwrap(),
+        }
+    }
+}
+
+impl<MT> Named for LineageMutator<MT> {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<I, S, MT> Mutator<I, S> for LineageMutator<MT>
+where
+    S: HasRand + HasMetadata + HasExecutions + HasStartTime,
+    MT: MutatorsTuple<I, S> + NamedTuple,
+{
+    fn mutate(&mut self, state: &mut S, input: &mut I) -> Result<MutationResult, Error> {
+        let execs = *state.executions();
+        let elapsed_ms = (libafl_bolts::current_time() - *state.start_time()).as_millis() as u64;
+
+        if state.metadata_map().contains::<MutationLog>() {
+            let log = state.metadata_map_mut().get_mut::<MutationLog>().unwrap();
+            log.names.clear();
+            log.execs = execs;
+            log.elapsed_ms = elapsed_ms;
+        } else {
+            state.add_metadata(MutationLog { names: vec![], execs, elapsed_ms });
+        }
+
+        let num = 1 + state.rand_mut().below(self.max_stack_pow);
+        let mutations_len =
+            NonZeroUsize::new(self.mutations.len()).expect("mutations must be non-empty");
+        let mut result = MutationResult::Skipped;
+
+        for _ in 0..num {
+            let idx = state.rand_mut().below(mutations_len);
+            let outcome = self.mutations.get_and_mutate(idx.into(), state, input)?;
+            if outcome == MutationResult::Mutated {
+                result = MutationResult::Mutated;
+                if let Some(name) = self.mutations.name(idx as usize) {
+                    state
+                        .metadata_map_mut()
+                        .get_mut::<MutationLog>()
+                        .unwrap()
+                        .names
+                        .push(name.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+pub struct LineageFeedback {
+    name: Cow<'static, str>,
+}
+
+impl LineageFeedback {
+    pub fn new() -> Self {
+        Self { name: "LineageFeedback".into() }
+    }
+}
+
+impl Named for LineageFeedback {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<S> StateInitializer<S> for LineageFeedback {}
+
+impl<EM, OT, S> Feedback<EM, GramatronInput, OT, S> for LineageFeedback
+where
+    S: HasMetadata + HasCurrentCorpusId + HasCorpus + HasExecutions + HasStartTime,
+{
+    fn append_metadata(
+        &mut self,
+        state: &mut S,
+        _manager: &mut EM,
+        _observers: &OT,
+        testcase: &mut Testcase<GramatronInput>,
+    ) -> Result<(), Error> {
+        if let Some(log) = state.metadata_map().get::<MutationLog>() {
+            if !log.names.is_empty() {
+                testcase.add_metadata(LogMutationMetadata::new(log.names.clone()));
+            }
+        }
+
+        if let Some(parent_id) = state.current_corpus_id().ok().flatten() {
+            let parent_file = state
+                .corpus()
+                .get(parent_id)
+                .ok()
+                .and_then(|tc| tc.borrow().filename().clone());
+
+            let (execs, elapsed_ms) = state
+                .metadata_map()
+                .get::<MutationLog>()
+                .map(|log| (log.execs, log.elapsed_ms))
+                .unwrap_or_else(|| {
+                    let execs = *state.executions();
+                    let elapsed_ms =
+                        (libafl_bolts::current_time() - *state.start_time()).as_millis() as u64;
+                    (execs, elapsed_ms)
+                });
+
+            testcase.add_metadata(ParentInfo {
+                parent_id: Some(usize::from(parent_id) as u64),
+                parent_file,
+                execs,
+                elapsed_ms,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// The fuzzer main (as `no_mangle` C function)
 #[no_mangle]
@@ -265,7 +426,8 @@ fn fuzz(
         // New maximization map feedback linked to the edges observer and the feedback state
         MaxMapFeedback::new(&edges_observer),
         // Time feedback, this one does not need a feedback state
-        TimeFeedback::new(&time_observer)
+        TimeFeedback::new(&time_observer),
+        LineageFeedback::new()
     );
 
     // A feedback to choose if an input is a solution or not
@@ -339,7 +501,7 @@ fn fuzz(
     }
 
     // Setup a basic mutator with a mutational stage
-    let mutator = StdScheduledMutator::with_max_stack_pow(
+    let mutator = LineageMutator::with_max_stack_pow(
         tuple_list!(
             GramatronRandomMutator::new(&generator),
             GramatronRandomMutator::new(&generator),
@@ -353,8 +515,7 @@ fn fuzz(
             GramatronRecursionMutator::new()
         ),
         3,
-    )
-    .unwrap();
+    );
 
     let fuzzbench = libafl::stages::DumpToDiskStage::new(
         |input: &GramatronInput, _state: &_| {

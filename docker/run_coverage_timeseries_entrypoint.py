@@ -122,7 +122,8 @@ def get_branch_coverage(running: str, report_dir: str = None):
 # ── main ─────────────────────────────────────────────────────────────────────
 
 # 1. Collect all corpus inputs with timestamps
-inputs = []  # (elapsed_ms, filepath)
+# Prefer elapsed_ms from .metadata; fall back to file mtime relative to earliest.
+raw = []  # (elapsed_ms_or_None, mtime, filepath)
 for fname in os.listdir(CORPUS_DIR):
     if fname.startswith("."):
         continue
@@ -131,13 +132,22 @@ for fname in os.listdir(CORPUS_DIR):
         continue
     meta_path = os.path.join(CORPUS_DIR, f".{fname}.metadata")
     elapsed = get_elapsed_ms(meta_path) if os.path.exists(meta_path) else None
-    inputs.append((elapsed if elapsed is not None else 0, fpath))
+    mtime = os.path.getmtime(fpath)
+    raw.append((elapsed, mtime, fpath))
 
-inputs.sort()
-if not inputs:
+if not raw:
     print("No inputs found.", file=sys.stderr)
     sys.exit(1)
 
+# If no file carried elapsed_ms, synthesize it from mtime-since-earliest.
+if all(e is None for (e, _m, _f) in raw):
+    earliest = min(m for (_e, m, _f) in raw)
+    inputs = [(int((m - earliest) * 1000), f) for (_e, m, f) in raw]
+    print("(fallback) deriving elapsed_ms from file mtime relative to earliest seed")
+else:
+    inputs = [((e if e is not None else 0), f) for (e, _m, f) in raw]
+
+inputs.sort()
 max_elapsed_ms = inputs[-1][0]
 print(f"Found {len(inputs)} inputs, max elapsed: {max_elapsed_ms/3600000:.2f}h")
 

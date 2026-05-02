@@ -71,4 +71,3 @@ done
 
 echo ""
 echo "==> Done. Reports under ${COV_DIR}/"
-done

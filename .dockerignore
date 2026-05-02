@@ -1,0 +1,21 @@
+target/
+out/
+out_blockers/
+**/target/
+# agent_fuzzer is a workspace member; only skip its heavy subdirs.
+agent_fuzzer/out/
+agent_fuzzer/agent/
+agent_fuzzer/NOTES.md
+agent_fuzzer/PROTOTYPE.md
+agent_fuzzer/*.log
+agent_fuzzer/*.sh
+agent_fuzzer/*.py
+agent_fuzzer/*.c
+agent_fuzzer/*.profraw
+agent_fuzzer/.claude/
+results/
+*.log
+*.png
+*.pdf
+*.profraw
+.git/

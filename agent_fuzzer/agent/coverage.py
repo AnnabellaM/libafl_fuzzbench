@@ -478,6 +478,143 @@ def verify_candidates_batch(
     return results
 
 
+def harvest_incidental_flips(
+    candidates: list[bytes],
+    verify_work_dir: Path,
+    pending: list[dict],
+    exclude_branch_ids: set[str] | None = None,
+) -> list[tuple[dict, int, bytes]]:
+    """Scan coverage JSONs from a completed verify_candidates_batch and
+    auto-promote any pending blocker whose missing side was incidentally
+    covered by one of the verified candidates.
+
+    Expects <verify_work_dir>/out/json/cand_NNN.json to already exist. Reads
+    only — no re-execution.
+
+    `pending` entries match run.py's in-memory shape: dicts with keys
+    "branch" (Branch), "missing_side" ("true"|"false").
+    `exclude_branch_ids` should include the primary target's branch.id plus
+    any already-resolved ids, to prevent double-credit.
+
+    Returns [(pending_entry, candidate_index, candidate_bytes), ...]. The
+    caller is responsible for recording results and filtering pending.
+    """
+    if not candidates or not pending:
+        return []
+
+    exclude = exclude_branch_ids or set()
+
+    by_file: dict[str, list[dict]] = {}
+    for entry in pending:
+        br = entry["branch"]
+        if br.id in exclude:
+            continue
+        by_file.setdefault(br.file, []).append(entry)
+    if not by_file:
+        return []
+
+    json_dir = verify_work_dir / "out" / "json"
+    if not json_dir.is_dir():
+        return []
+
+    harvested: list[tuple[dict, int, bytes]] = []
+    already_promoted: set[str] = set()
+
+    for c_idx in range(len(candidates)):
+        jf = json_dir / f"cand_{c_idx:03d}.json"
+        if not jf.exists():
+            continue
+        try:
+            data = json.loads(jf.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        per_file_counts: dict[str, dict[tuple[int, int], tuple[int, int]]] = {}
+        for d_entry in data.get("data", []):
+            for fd in d_entry.get("files", []):
+                fname = fd.get("filename", "")
+                if fname not in by_file:
+                    continue
+                bucket = per_file_counts.setdefault(fname, {})
+                for br in fd.get("branches", []):
+                    if len(br) < 6:
+                        continue
+                    bucket[(br[0], br[1])] = (br[4], br[5])
+
+        for fname, entries in by_file.items():
+            counts = per_file_counts.get(fname)
+            if not counts:
+                continue
+            for entry in entries:
+                br = entry["branch"]
+                if br.id in already_promoted:
+                    continue
+                ct = counts.get((br.line_start, br.col_start))
+                if not ct:
+                    continue
+                t_cnt, f_cnt = ct
+                hit = ((entry["missing_side"] == "true"  and t_cnt > 0) or
+                       (entry["missing_side"] == "false" and f_cnt > 0))
+                if hit:
+                    harvested.append((entry, c_idx, candidates[c_idx]))
+                    already_promoted.add(br.id)
+
+    return harvested
+
+
+def harvest_loop_coverage(
+    coverage_dir: Path,
+    pending: list[dict],
+    exclude_branch_ids: set[str] | None = None,
+) -> list[tuple[dict, bytes]]:
+    """Cross-blocker harvest for the loop path.
+
+    `coverage_dir` is a per-workspace directory populated by verify_one.py
+    (when `VERIFY_COVERAGE_DIR` is set): it contains `out/json/cand_NNN.json`
+    + `seeds/cand_NNN` — one pair per verify call the LLM made.
+
+    Returns [(pending_entry, candidate_bytes), ...]: pending blockers whose
+    missing side was incidentally covered by *any* of the agent's candidates
+    (excluding the primary blocker + anything in `exclude_branch_ids`).
+
+    Thin wrapper over `harvest_incidental_flips` — reads the per-slot seed
+    bytes off disk then delegates matching logic.
+    """
+    if not pending:
+        return []
+    seeds_dir = coverage_dir / "seeds"
+    json_dir = coverage_dir / "out" / "json"
+    if not seeds_dir.is_dir() or not json_dir.is_dir():
+        return []
+
+    # Order candidates by slot index so list[i] matches cand_NNN.json.
+    slot_files = sorted(json_dir.glob("cand_*.json"))
+    candidates: list[bytes] = []
+    for jf in slot_files:
+        name = jf.stem  # cand_NNN
+        seed_file = seeds_dir / name
+        if not seed_file.exists():
+            candidates.append(b"")
+            continue
+        try:
+            candidates.append(seed_file.read_bytes())
+        except OSError:
+            candidates.append(b"")
+
+    if not candidates:
+        return []
+
+    hits = harvest_incidental_flips(
+        candidates=candidates,
+        verify_work_dir=coverage_dir,
+        pending=pending,
+        exclude_branch_ids=exclude_branch_ids,
+    )
+    # Drop the slot index from the tuple — callers of the loop-path harvest
+    # only need the seed bytes + pending entry.
+    return [(entry, cand_bytes) for (entry, _slot, cand_bytes) in hits]
+
+
 def read_source_line(target: str, branch: Branch, cache_dir: Path) -> str:
     """Return just the branch's source line (for negative-rule filtering)."""
     local = fetch_source_file(target, branch.file, cache_dir)

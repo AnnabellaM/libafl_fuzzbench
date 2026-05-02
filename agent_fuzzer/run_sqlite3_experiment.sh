@@ -12,13 +12,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 TARGET="sqlite3"
-TRIALS=1
-DURATION=3600          # 1 hour
-PLATEAU_SECS=90        # 90 seconds
-AGENT_BUDGET_SECS=300  # 5 minutes
-AGENT_MAX_TURNS=50
-INTERVAL_MIN=5         # coverage checkpoint every 5 min
-FUZZ_BIN="ossfuzz"     # sqlite3 binary name
+TRIALS="${TRIALS:-1}"
+DURATION="${DURATION:-3600}"               # default 1 hour, override via env
+PLATEAU_SECS="${PLATEAU_SECS:-90}"
+AGENT_BUDGET_SECS="${AGENT_BUDGET_SECS:-300}"
+AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-50}"
+AGENT_BRIDGE="${AGENT_BRIDGE:-run_agent.sh}"  # run_agent_loop.sh for AGENT_USE_LOOP path
+INTERVAL_MIN="${INTERVAL_MIN:-5}"
+FUZZ_BIN="ossfuzz"
 
 EXP_DIR="${SCRIPT_DIR}/out/${TARGET}"
 COV_DIR="${EXP_DIR}/coverage_ts"
@@ -113,6 +114,7 @@ for trial in $(seq 1 "$TRIALS"); do
     TARGET_NAME="$TARGET" \
     SKIP_DOCKER_BUILD=1 \
     AGENT_MAX_TURNS="$AGENT_MAX_TURNS" \
+    AGENT_BRIDGE="$AGENT_BRIDGE" \
     POLL_INTERVAL=5 \
         "$SCRIPT_DIR/watch_agent.sh" "$ipc_dir" \
         > "${EXP_DIR}/agent-watcher-trial${trial}.log" 2>&1 &

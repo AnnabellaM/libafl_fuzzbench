@@ -17,18 +17,22 @@ set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────────────────────
 TRIALS=3
+TRIAL_START=1         # first trial index (e.g. set to 4 to add trials 4..N+3)
 DURATION=86400        # 24 hours in seconds
 FUZZERS="generic fast naive cmplog mopt"
 TARGETS="harfbuzz bloaty"
+MAX_PARALLEL=64       # max simultaneous trial containers; trials beyond this batch
 RESULTS_DIR="$(pwd)/out"
 SEEDS_DIR="$(pwd)/docker/seeds"
 # ── arg parsing ─────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --trials)   TRIALS="$2";   shift 2 ;;
-        --duration) DURATION="$2"; shift 2 ;;
-        --fuzzers)  FUZZERS="$2";  shift 2 ;;
-        --targets)  TARGETS="$2";  shift 2 ;;
+        --trials)       TRIALS="$2";       shift 2 ;;
+        --trial-start)  TRIAL_START="$2";  shift 2 ;;
+        --duration)     DURATION="$2";     shift 2 ;;
+        --fuzzers)      FUZZERS="$2";      shift 2 ;;
+        --targets)      TARGETS="$2";      shift 2 ;;
+        --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -65,55 +69,79 @@ if [[ ${#failed_builds[@]} -gt 0 ]]; then
     for img in "${failed_builds[@]}"; do echo "    ${img}"; done
 fi
 
-# ── step 3: launch experiments ───────────────────────────────────────────────
-# Assign each container its own CPU core to avoid interference.
-cpu=0
-pids=()
-
+# ── step 3: launch experiments in batches of MAX_PARALLEL ───────────────────
+# Build the flat list of (target, fuzzer, trial) tuples, skipping failed builds.
+combos=()
 for target in $TARGETS; do
     for fuzzer in $FUZZERS; do
-        for trial in $(seq 1 "$TRIALS"); do
-            image="libafl-${target}-${fuzzer}"
-            name="${target}-${fuzzer}-trial${trial}"
-            corpus="${RESULTS_DIR}/${target}/${fuzzer}/trial${trial}"
-            seeds="${SEEDS_DIR}/${target}"
-
-            # Skip if the image failed to build
-            if [[ " ${failed_builds[*]} " == *" ${image} "* ]]; then
-                continue
-            fi
-
-            mkdir -p "$corpus"
-
-            echo "==> Starting ${name} on CPU ${cpu}..."
-            # Only mount the seeds volume if the directory exists and is non-empty;
-            # otherwise let the container use the seeds embedded in the image.
-            seed_vol=()
-            if [ -d "${seeds}" ] && [ -n "$(ls -A "${seeds}" 2>/dev/null)" ]; then
-                seed_vol=(-v "${seeds}:/seeds:ro")
-            fi
-
-            cid=$(docker run -d \
-                --name "${name}" \
-                --cpuset-cpus "${cpu}" \
-                --memory "4g" \
-                -v "${corpus}:/corpus" \
-                "${seed_vol[@]}" \
-                -e DURATION="${DURATION}" \
-            "${image}")
-            docker logs -f "${cid}" 2>&1 | tee "${RESULTS_DIR}/${name}.log" &
-
-            pids+=($!)
-            (( cpu++ )) || true
+        image="libafl-${target}-${fuzzer}"
+        if [[ " ${failed_builds[*]} " == *" ${image} "* ]]; then
+            continue
+        fi
+        for trial in $(seq "$TRIAL_START" $((TRIAL_START + TRIALS - 1))); do
+            combos+=("$target $fuzzer $trial")
         done
     done
 done
 
-echo ""
-echo "==> All experiments launched. Containers running:"
-docker ps --filter "name=${TARGETS// /|}" --format "table {{.Names}}\t{{.Status}}\t{{.CPUPerc}}"
+total=${#combos[@]}
+echo "==> ${total} trial(s) queued; running ${MAX_PARALLEL} in parallel."
+
+i=0
+batch_idx=0
+while (( i < total )); do
+    batch_idx=$((batch_idx + 1))
+    cids=()
+    log_pids=()
+    cpu=${CPU_START:-0}
+    batch_size=0
+    while (( batch_size < MAX_PARALLEL && i < total )); do
+        read -r target fuzzer trial <<< "${combos[$i]}"
+        image="libafl-${target}-${fuzzer}"
+        name="${target}-${fuzzer}-trial${trial}"
+        corpus="${RESULTS_DIR}/${target}/${fuzzer}/trial${trial}"
+        seeds="${SEEDS_DIR}/${target}"
+        mkdir -p "$corpus"
+
+        seed_vol=()
+        if [ -d "${seeds}" ] && [ -n "$(ls -A "${seeds}" 2>/dev/null)" ]; then
+            seed_vol=(-v "${seeds}:/seeds:ro")
+        fi
+
+        # Remove any stale container with the same name (from a prior aborted run).
+        docker rm -f "${name}" >/dev/null 2>&1 || true
+
+        echo "==> [batch ${batch_idx}] Starting ${name} on CPU ${cpu}..."
+        cid=$(docker run -d \
+            --name "${name}" \
+            --cpuset-cpus "${cpu}" \
+            --memory "4g" \
+            -v "${corpus}:/corpus" \
+            "${seed_vol[@]}" \
+            -e DURATION="${DURATION}" \
+            "${image}")
+        docker logs -f "${cid}" > "${RESULTS_DIR}/${name}.log" 2>&1 &
+        log_pids+=($!)
+        cids+=("$cid")
+        (( cpu++ )) || true
+        i=$((i + 1))
+        batch_size=$((batch_size + 1))
+    done
+
+    echo "==> [batch ${batch_idx}] ${#cids[@]} containers launched; waiting for completion..."
+    for cid in "${cids[@]}"; do
+        docker wait "$cid" >/dev/null
+    done
+    # Reap log followers and clean up containers.
+    for pid in "${log_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    for cid in "${cids[@]}"; do
+        docker rm "$cid" >/dev/null 2>&1 || true
+    done
+    echo "==> [batch ${batch_idx}] complete."
+done
 
 echo ""
-echo "To follow logs:    docker logs -f <container-name>"
-echo "To stop all:       docker stop \$(docker ps -q --filter name=libafl)"
+echo "==> All ${total} trial(s) finished."
 echo "Results at:        ${RESULTS_DIR}/"

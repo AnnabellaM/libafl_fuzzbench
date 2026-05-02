@@ -493,9 +493,11 @@ fn fuzz(
         println!("We imported {} inputs from disk.", state.corpus().count());
     }
 
-    // Remove target ouput (logs still survive)
+    // Remove target output (logs still survive)
+    // Skip when LIBAFL_KEEP_STDIO=1 — needed to surface panic messages from
+    // fuzz_loop on synthetic harnesses; default behavior unchanged.
     #[cfg(unix)]
-    {
+    if std::env::var("LIBAFL_KEEP_STDIO").is_err() {
         let null_fd = file_null.as_raw_fd();
         dup2(null_fd, io::stdout().as_raw_fd())?;
         dup2(null_fd, io::stderr().as_raw_fd())?;

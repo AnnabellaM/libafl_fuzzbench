@@ -5,7 +5,11 @@
 /out/
 /out_blockers/
 /agent_fuzzer/out/
-
+/out_libpcap_8g_test/
+/targets/
+/docker/targets_backup/
+/out_backup/
+/agent_fuzzer/
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
 Cargo.lock
